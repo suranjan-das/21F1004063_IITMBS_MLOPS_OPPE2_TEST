@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: heart-api-deployment
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: heart-api
+  template:
+    metadata:
+      labels:
+        app: heart-api
+    spec:
+      serviceAccountName: telemetry-access
+      containers:
+      - name: heart-api-container
+        image: us-central1-docker.pkg.dev/exalted-point-473314-c5/mlops-repo-2025/heart-api:latest
+        ports:
+        - containerPort: 8200
+        env:
+        - name: MODEL_PATH
+          value: /app/heart_model.joblib
+        readinessProbe:
+          httpGet:
+            path: /ready_check
+            port: 8200
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          timeoutSeconds: 2
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /live_check
+            port: 8200
+          initialDelaySeconds: 25
+          periodSeconds: 20
+          timeoutSeconds: 2
+          failureThreshold: 3
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"

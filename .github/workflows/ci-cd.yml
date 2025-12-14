@@ -1,0 +1,109 @@
+name: Build-And-Deploy-to-GKE
+
+on:
+  push:
+    branches: [ "main" ]
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT }}
+  REGION: ${{ secrets.GCP_REGION }}
+  ARTIFACT_REPO: ${{ secrets.ARTIFACT_REPO }}
+  IMAGE_NAME: ${{ secrets.IMAGE_NAME }}
+  CLUSTER_NAME: ${{ secrets.CLUSTER_NAME }}
+  CLUSTER_ZONE: ${{ secrets.CLUSTER_ZONE }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout source
+      uses: actions/checkout@v4
+
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v1
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+    - name: Enable required GCP APIs
+      run: |
+        gcloud services enable \
+          container.googleapis.com \
+          logging.googleapis.com \
+          monitoring.googleapis.com \
+          cloudtrace.googleapis.com
+
+    - name: Configure docker for Artifact Registry
+      run: |
+        gcloud config set project $PROJECT_ID
+        gcloud auth configure-docker ${REGION}-docker.pkg.dev --quiet
+
+    - name: Build and push Docker image
+      id: build-image
+      uses: docker/build-push-action@v4
+      with:
+        push: true
+        tags: |
+          ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REPO }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REPO }}/${{ env.IMAGE_NAME }}:latest
+        file: ./Dockerfile
+        platforms: linux/amd64
+
+    - name: Create or update GKE cluster
+      run: |
+        echo "Checking if cluster $CLUSTER_NAME exists..."
+        if gcloud container clusters describe $CLUSTER_NAME --zone $CLUSTER_ZONE --project $PROJECT_ID > /dev/null 2>&1; then
+          echo "Cluster $CLUSTER_NAME already exists. Skipping creation."
+        else
+          echo "Creating cluster $CLUSTER_NAME..."
+          gcloud container clusters create $CLUSTER_NAME \
+            --zone=$CLUSTER_ZONE \
+            --num-nodes=2 \
+            --disk-type=pd-standard \
+            --disk-size=50 \
+            --workload-pool=${PROJECT_ID}.svc.id.goog \
+            --logging=SYSTEM,WORKLOAD \
+            --monitoring=SYSTEM
+        fi
+
+    - name: Get GKE credentials
+      uses: google-github-actions/get-gke-credentials@v1
+      with:
+        cluster_name: ${{ env.CLUSTER_NAME }}
+        location: ${{ env.CLUSTER_ZONE }}
+        project_id: ${{ env.PROJECT_ID }}
+
+    # ⬇️ Namespace-related step removed
+
+    - name: Setup Kubernetes telemetry access
+      run: |
+        echo "Setting up Kubernetes service account telemetry-access in default namespace..."
+        kubectl create serviceaccount telemetry-access || true
+        kubectl annotate serviceaccount telemetry-access \
+          iam.gke.io/gcp-service-account=telemetry-access@${PROJECT_ID}.iam.gserviceaccount.com --overwrite
+        gcloud iam service-accounts add-iam-policy-binding telemetry-access@${PROJECT_ID}.iam.gserviceaccount.com \
+          --role roles/iam.workloadIdentityUser \
+          --member "serviceAccount:${PROJECT_ID}.svc.id.goog[default/telemetry-access]" || echo "Skipping IAM binding (permission may be limited)."
+
+    - name: Deploy application manifests to GKE
+      run: |
+        IMAGE_REF=${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REPO}/${IMAGE_NAME}:${{ github.sha }}
+        echo "Using image: $IMAGE_REF"
+
+        sed -e "s|image: .*heart-api:.*|image: ${IMAGE_REF}|g" \
+            k8s/deployment.yaml > k8s/deployment.generated.yaml
+
+        kubectl apply -f k8s/deployment.generated.yaml
+        kubectl apply -f k8s/service.yaml
+        kubectl apply -f k8s/hpa.yaml
+
+    - name: Wait for rollout
+      run: |
+        echo "Waiting for deployment rollout..."
+        kubectl rollout status deployment/heart-api-deployment --timeout=180s
+
+
+    - name: Output service info
+      run: |
+        echo "Deployment completed successfully."
+        kubectl get svc -o wide
